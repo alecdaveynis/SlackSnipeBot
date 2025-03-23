@@ -1,66 +1,115 @@
-import os
-from flask import Flask, request, jsonify
+import requests
 import json
-from slack_sdk import WebClient # type: ignore
-from slack_sdk.errors import SlackApiError # type: ignore
+import re
+import pandas as pd
+import os
+from datetime import datetime
+from dotenv import load_dotenv
 
-client = WebClient(token=os.environ['SLACK_BOT_TOKEN'])
+# Slack API Tokens
+load_dotenv() 
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+HEADERS = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
 
-#create leaderboard
-leaderboard: dict[str, int] = {}    
+# Ensure data directory exists
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-app = Flask(__name__)
+def get_all_users():
+    """Fetch all Slack users and map IDs to names."""
+    user_map = {}
+    cursor = None  
 
-@app.route('/api/slack/snipe', methods=['GET'])
-def slack_events():
-    #data = request.json
-    # "@Username"
-    # project id: os.environ['SNIPE_PROJECT_ID']
-    response = client.conversations_list()
-    conversations = response["channels"]
-    return json.dumps(conversations), 200
-    #channel_id=os.environ['SNIPE_PROJECT_ID']
-    channel_id="C07RGCK862C"
+    while True:
+        url = "https://slack.com/api/users.list"
+        if cursor:
+            url += f"?cursor={cursor}"
 
-    #print(channel_id)
-    response = client.conversations_history(channel=channel_id)
+        response = requests.get(url, headers=HEADERS)
+        data = response.json()
 
-    conversation_history = response["messages"]
-    return json.dumps(conversation_history), 200
+        if data.get("ok"):
+            for user in data.get("members", []):
+                user_id = user.get("id")
+                user_name = (
+                    user["profile"].get("display_name") or 
+                    user["profile"].get("real_name") or 
+                    user.get("name", user_id)
+                )
+                user_map[user_id] = user_name
 
-    if 'event' in data:
-        event = data['event']
-        # Look for messages that contain an image and an @mention
-        if event['type'] == 'message' and 'text' in event:
-            text = event['text']
-            user = event['user']
+            cursor = data.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+        else:
+            print("Error fetching users:", data.get("error"))
+            break
 
-            if '@' in text:
-                # Extract the mentioned user (e.g., @user)
-                mentioned_user = text.split('@')[1].strip()
+    return user_map
 
-                # Update leaderboard
-                leaderboard[mentioned_user] = leaderboard.get(mentioned_user, 0) + 1
+def fetch_slack_messages(channel_id):
+    """Fetch messages from a Slack channel."""
+    url = f"https://slack.com/api/conversations.history?channel={channel_id}&limit=100"
+    response = requests.get(url, headers=HEADERS)
+    
+    data = response.json()
+    if not data.get("ok"):
+        print(f"Error fetching messages: {data.get('error')}")
+    
+    return data
 
-                try:
-                    response = client.chat_postMessage(
-                        channel=event['channel'],
-                        text=f"{mentioned_user} has been sniped! Total: {leaderboard[mentioned_user]} snipes."
-                    )
-                except SlackApiError as e:
-                    print(f"Error posting message: {e.response['error']}")
+def process_messages(channel_id):
+    """Process messages and extract snipes."""
+    user_map = get_all_users()
+    response = fetch_slack_messages(channel_id)
+    snipe_logs = []
 
-    return jsonify({'status': 'ok'})
+    if response.get("ok"):
+        for message in response.get("messages", []):
+            text = message.get("text", "")
+            user_id = message.get("user", "UNKNOWN_USER")
+            timestamp = message.get("ts", "")
 
-@app.route('/api/slack/leaderboard', methods=['POST'])
-def leaderboard_command():
-    sorted_leaderboard = sorted(leaderboard.items(), key=lambda x: x[1], reverse=True)
-    leaderboard_text = "\n".join([f"{user}: {snipes} snipes" for user, snipes in sorted_leaderboard])
+            mentioned_users = re.findall(r"<@([A-Z0-9]+)(?:\|[^>]+)?>", text)
 
-    return jsonify({
-        'response_type': 'in_channel',
-        'text': f"Sniping Leaderboard:\n{leaderboard_text}"
-    })
+            if user_id == "UNKNOWN_USER":
+                continue
+
+            if not mentioned_users:
+                continue
+
+            for mentioned_user in mentioned_users:
+                sender_name = user_map.get(user_id, "Unknown User")
+                target_name = user_map.get(mentioned_user, "Unknown User")
+
+                if sender_name == "Unknown User" or target_name == "Unknown User":
+                    continue
+
+                readable_timestamp = datetime.fromtimestamp(float(timestamp)).strftime("%B %d, %Y %I:%M%p")
+
+                snipe_logs.append({
+                    "snipe_sender": sender_name,
+                    "snipe_target": target_name,
+                    "timestamp": readable_timestamp
+                })
+
+    # Save to JSON
+    json_path = os.path.join(DATA_DIR, "snipe_logs.json")
+    with open(json_path, "w") as file:
+        json.dump(snipe_logs, file, indent=4)
+
+    # Convert to DataFrame for SQL table format
+    df = pd.DataFrame(snipe_logs)
+
+    # Rename columns to match SQL table format
+    df.rename(columns={"timestamp": "Time", "snipe_target": "Who got Sniped", "snipe_sender": "Sniper"}, inplace=True)
+
+    # Save to CSV
+    csv_path = os.path.join(DATA_DIR, "snipe_logs.csv")
+    df.to_csv(csv_path, index=False)
+
+    print(f"Snipe logs saved to '{json_path}' and '{csv_path}'.")
 
 if __name__ == "__main__":
-    app.run(port=3000)
+    process_messages(CHANNEL_ID)
