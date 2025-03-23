@@ -1,1 +1,2 @@
-# slackbot
+SlackBot 
+Author: Alec Daveynis
